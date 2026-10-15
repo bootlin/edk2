@@ -1403,6 +1403,44 @@ CreateVfResourceNode (
 }
 
 /**
+  Check whether a resource node has any fixed resource children.
+
+  A bridge window whose only children are fixed resources carries no
+  relocatable request of its own, but it must remain in the resource tree so
+  that the fixed BARs it contains are walked by ProgramResource() and marked as
+  allocated. The check is recursive, as such containers may be nested further
+  down the PCI hierarchy.
+
+  @param Node  PCI resource node.
+
+  @retval TRUE   The node has at least one fixed resource child.
+  @retval FALSE  The node has no fixed resource children.
+
+**/
+STATIC
+BOOLEAN
+HasFixedChildren (
+  IN PCI_RESOURCE_NODE  *Node
+  )
+{
+  LIST_ENTRY         *Link;
+  PCI_RESOURCE_NODE  *Child;
+
+  for ( Link = GetFirstNode (&Node->ChildList)
+        ; !IsNull (&Node->ChildList, Link)
+        ; Link = GetNextNode (&Node->ChildList, Link)
+        )
+  {
+    Child = RESOURCE_NODE_FROM_LINK (Link);
+    if (Child->Fixed || HasFixedChildren (Child)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
   This function is used to extract resource request from
   device node list.
 
@@ -1540,7 +1578,7 @@ CreateResourceMap (
         PMem64Bridge
         );
 
-      if (ResourceRequestExisted (IoBridge)) {
+      if (ResourceRequestExisted (IoBridge) || HasFixedChildren (IoBridge)) {
         InsertResourceNode (
           IoNode,
           IoBridge
@@ -1556,7 +1594,7 @@ CreateResourceMap (
       // and insert it into the respective resource tree.
       // If no, delete this resource bridge
       //
-      if (ResourceRequestExisted (Mem32Bridge)) {
+      if (ResourceRequestExisted (Mem32Bridge) || HasFixedChildren (Mem32Bridge)) {
         InsertResourceNode (
           Mem32Node,
           Mem32Bridge
@@ -1572,7 +1610,7 @@ CreateResourceMap (
       // and insert it into the respective resource tree.
       // If no, delete this resource bridge
       //
-      if (ResourceRequestExisted (PMem32Bridge)) {
+      if (ResourceRequestExisted (PMem32Bridge) || HasFixedChildren (PMem32Bridge)) {
         InsertResourceNode (
           PMem32Node,
           PMem32Bridge
@@ -1588,7 +1626,7 @@ CreateResourceMap (
       // and insert it into the respective resource tree.
       // If no, delete this resource bridge
       //
-      if (ResourceRequestExisted (Mem64Bridge)) {
+      if (ResourceRequestExisted (Mem64Bridge) || HasFixedChildren (Mem64Bridge)) {
         InsertResourceNode (
           Mem64Node,
           Mem64Bridge
@@ -1604,7 +1642,7 @@ CreateResourceMap (
       // and insert it into the respective resource tree.
       // If no, delete this resource bridge
       //
-      if (ResourceRequestExisted (PMem64Bridge)) {
+      if (ResourceRequestExisted (PMem64Bridge) || HasFixedChildren (PMem64Bridge)) {
         InsertResourceNode (
           PMem64Node,
           PMem64Bridge

@@ -2586,6 +2586,17 @@ ResourceRequestExisted (
           )
     {
       Node = RESOURCE_NODE_FROM_LINK (Link);
+
+      if (IsPpbWindowNode (Node) && (Node->Length == 0)) {
+        //
+        // A bridge window with a zero length aggregates no relocatable
+        // request below it, and may only be a container for fixed resources.
+        // Do not let it cause a zero-length request to be submitted for this
+        // bridge.
+        //
+        continue;
+      }
+
       if (!Node->Fixed) {
         return TRUE;
       }

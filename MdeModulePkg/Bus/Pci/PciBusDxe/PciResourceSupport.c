@@ -409,12 +409,58 @@ IsResource64BitCapable (
 }
 
 /**
+  Sort two fixed resource nodes by their fixed base address.
+
+  @param Buffer1  Pointer to the first fixed resource node pointer.
+  @param Buffer2  Pointer to the second fixed resource node pointer.
+
+  @retval <0  Buffer1 sorts before Buffer2.
+  @retval  0  Buffer1 and Buffer2 sort equal.
+  @retval >0  Buffer1 sorts after Buffer2.
+
+**/
+STATIC
+INTN
+EFIAPI
+CompareFixedNodeBase (
+  IN CONST VOID  *Buffer1,
+  IN CONST VOID  *Buffer2
+  )
+{
+  PCI_RESOURCE_NODE  *Node1;
+  PCI_RESOURCE_NODE  *Node2;
+
+  Node1 = *(PCI_RESOURCE_NODE *CONST *)Buffer1;
+  Node2 = *(PCI_RESOURCE_NODE *CONST *)Buffer2;
+
+  if (Node1->FixedBase < Node2->FixedBase) {
+    return -1;
+  }
+
+  if (Node1->FixedBase > Node2->FixedBase) {
+    return 1;
+  }
+
+  return 0;
+}
+
+/**
   Pin the window of a PCI-PCI bridge if there are fixed resources below it.
 
   The window must cover the fixed ranges, and so its placement is dictated by
-  them rather than by the resource allocator. The window is sized to span all
+  them rather than by the resource allocator. The window is sized to span the
   fixed ranges below it, rounded to the window granularity, and becomes a fixed
   resource itself, which may in turn pin the windows of upstream bridges.
+
+  A bridge window is described by a single Base/Limit register pair, so it can
+  only cover a contiguous set of fixed ranges. If the fixed ranges below the
+  bridge are not contiguous, or if they cannot be represented by a window of
+  this type (for example, a 32-bit window cannot decode a range above 4 GB),
+  the window cannot be pinned: doing so would have it span unrelated address
+  ranges, overlapping the windows of sibling bridges, and the range could not
+  be programmed into the window registers anyway. In that case, the window is
+  left unprogrammed and the fixed BARs are assumed to be decoded directly by
+  the platform.
 
   Relocatable resources of the same type below the bridge cannot be
   accommodated in the pinned window, so they are dropped.
@@ -425,8 +471,9 @@ IsResource64BitCapable (
   @param Bridge  PCI resource node for a bridge.
 
   @retval TRUE   The window was pinned.
-  @retval FALSE  The node is not a PCI-PCI bridge window, or there are no fixed
-                 resources below it.
+  @retval FALSE  The node is not a PCI-PCI bridge window, there are no fixed
+                 resources below it, or the fixed resources cannot be
+                 represented by a single window of this type.
 
 **/
 STATIC
@@ -436,38 +483,19 @@ PinBridgeWindow (
   )
 {
   LIST_ENTRY         *Link;
+  PCI_RESOURCE_NODE  **FixedNodes;
   PCI_RESOURCE_NODE  *Node;
+  PCI_RESOURCE_NODE  *Swap;
+  UINTN              Count;
+  UINTN              Index;
   UINT64             FixedBase;
   UINT64             FixedLimit;
   UINT64             Granularity;
-  BOOLEAN            HasFixed;
+  BOOLEAN            Contiguous;
 
   if (!IsPpbWindowNode (Bridge) || (GetEaBridgeWindow (Bridge) != NULL)) {
     return FALSE;
   }
-
-  HasFixed   = FALSE;
-  FixedBase  = MAX_UINT64;
-  FixedLimit = 0;
-
-  for ( Link = GetFirstNode (&Bridge->ChildList)
-        ; !IsNull (&Bridge->ChildList, Link)
-        ; Link = GetNextNode (&Bridge->ChildList, Link)
-        )
-  {
-    Node = RESOURCE_NODE_FROM_LINK (Link);
-    if (Node->Fixed) {
-      HasFixed   = TRUE;
-      FixedBase  = MIN (FixedBase, Node->FixedBase);
-      FixedLimit = MAX (FixedLimit, Node->FixedLimit);
-    }
-  }
-
-  if (!HasFixed) {
-    return FALSE;
-  }
-
-  DropRelocatableResources (Bridge);
 
   if (Bridge->ResType == PciBarTypeIo16) {
     Granularity = Bridge->PciDev->BridgeIoAlignment;
@@ -475,9 +503,107 @@ PinBridgeWindow (
     Granularity = SIZE_1MB - 1;
   }
 
+  //
+  // Collect the fixed resources below the bridge window.
+  //
+  Count = 0;
+  for ( Link = GetFirstNode (&Bridge->ChildList)
+        ; !IsNull (&Bridge->ChildList, Link)
+        ; Link = GetNextNode (&Bridge->ChildList, Link)
+        )
+  {
+    Node = RESOURCE_NODE_FROM_LINK (Link);
+    if (Node->Fixed) {
+      Count++;
+    }
+  }
+
+  if (Count == 0) {
+    return FALSE;
+  }
+
+  FixedNodes = AllocatePool (Count * sizeof (PCI_RESOURCE_NODE *));
+  if (FixedNodes == NULL) {
+    return FALSE;
+  }
+
+  Index = 0;
+  for ( Link = GetFirstNode (&Bridge->ChildList)
+        ; !IsNull (&Bridge->ChildList, Link)
+        ; Link = GetNextNode (&Bridge->ChildList, Link)
+        )
+  {
+    Node = RESOURCE_NODE_FROM_LINK (Link);
+    if (Node->Fixed) {
+      FixedNodes[Index++] = Node;
+    }
+  }
+
+  //
+  // Check that the fixed ranges are contiguous. The child list is ordered by
+  // alignment, not by base address, so sort by base address first, and verify
+  // that there is no gap that is not absorbed by the window granularity.
+  //
+  QuickSort (FixedNodes, Count, sizeof (PCI_RESOURCE_NODE *), CompareFixedNodeBase, &Swap);
+
+  Contiguous = TRUE;
+  FixedBase  = FixedNodes[0]->FixedBase & ~Granularity;
+  FixedLimit = FixedNodes[0]->FixedLimit | Granularity;
+
+  for (Index = 1; Index < Count; Index++) {
+    if ((FixedNodes[Index]->FixedBase & ~Granularity) > FixedLimit + 1) {
+      Contiguous = FALSE;
+      break;
+    }
+
+    FixedLimit = MAX (FixedLimit, FixedNodes[Index]->FixedLimit | Granularity);
+  }
+
+  FreePool (FixedNodes);
+
+  if (!Contiguous) {
+    DEBUG ((
+      DEBUG_INFO,
+      "PciBus: [%02x|%02x|%02x] %s window not pinned: fixed resources are not contiguous\n",
+      Bridge->PciDev->BusNumber,
+      Bridge->PciDev->DeviceNumber,
+      Bridge->PciDev->FunctionNumber,
+      mBarTypeStr[MIN (Bridge->ResType, PciBarTypeMaxType)]
+      ));
+    return FALSE;
+  }
+
+  //
+  // The fixed range must be representable by a window of this type: a 32-bit
+  // window cannot decode a range above 4 GB, and a 16-bit I/O window cannot
+  // decode a range above 64 KB.
+  //
+  switch (Bridge->ResType) {
+    case PciBarTypeIo16:
+      if (FixedLimit > MAX_UINT16) {
+        return FALSE;
+      }
+
+      break;
+
+    case PciBarTypeIo32:
+    case PciBarTypeMem32:
+    case PciBarTypePMem32:
+      if (FixedLimit > MAX_UINT32) {
+        return FALSE;
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  DropRelocatableResources (Bridge);
+
   Bridge->Fixed      = TRUE;
-  Bridge->FixedBase  = FixedBase & ~Granularity;
-  Bridge->FixedLimit = FixedLimit | Granularity;
+  Bridge->FixedBase  = FixedBase;
+  Bridge->FixedLimit = FixedLimit;
   Bridge->Length     = Bridge->FixedLimit - Bridge->FixedBase + 1;
   Bridge->Alignment  = 0;
   Bridge->Offset     = 0;
